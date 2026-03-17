@@ -102,7 +102,7 @@ Commands:
   init      Create or refresh local config, and auto-start the macOS background service when available.
   doctor    Check Node.js, OpenClaw discovery, ports, local config, and Office preview dependencies.
   status    Show macOS background service status for npm installs.
-  stop      Stop the macOS background service for npm installs.
+  stop      Stop the background service (macOS launchd or Windows backend process).
   restart   Restart the macOS background service for npm installs.
   dev       Start both frontend and backend in development mode.
   start     Start the built backend server after checking dist/.
@@ -1515,6 +1515,71 @@ async function runStart(envFilePath) {
   });
 }
 
+
+function findWindowsListeningPids(port, spawnSyncImpl = spawnSync) {
+  const result = spawnSyncImpl('netstat', ['-ano', '-p', 'tcp'], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    throw new Error(`Failed to inspect TCP listeners with netstat (exit ${result.status ?? 'unknown'}).`);
+  }
+
+  const targetSuffix = `:${Number(port)}`;
+  const pids = new Set();
+  const lines = String(result.stdout || '').split(/\r?\n/);
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || !/\bLISTENING\b/i.test(trimmed)) {
+      continue;
+    }
+
+    const parts = trimmed.split(/\s+/);
+    if (parts.length < 5) {
+      continue;
+    }
+
+    const localAddress = parts[1] || '';
+    if (!localAddress.endsWith(targetSuffix)) {
+      continue;
+    }
+
+    const pid = Number.parseInt(parts[parts.length - 1], 10);
+    if (Number.isFinite(pid) && pid > 0) {
+      pids.add(pid);
+    }
+  }
+
+  return [...pids];
+}
+
+function stopWindowsBackgroundService(envFilePath, spawnSyncImpl = spawnSync) {
+  const { config } = buildChildEnv(envFilePath);
+  const pids = findWindowsListeningPids(config.backendPort, spawnSyncImpl);
+
+  if (!pids.length) {
+    return {
+      port: config.backendPort,
+      pids: [],
+      stopped: false,
+      failedPids: [],
+    };
+  }
+
+  const failedPids = [];
+  for (const pid of pids) {
+    const result = spawnSyncImpl('taskkill', ['/pid', String(pid), '/t', '/f'], { encoding: 'utf8' });
+    if (result.status !== 0) {
+      failedPids.push(pid);
+    }
+  }
+
+  return {
+    port: config.backendPort,
+    pids,
+    stopped: failedPids.length === 0,
+    failedPids,
+  };
+}
+
 function runStatus() {
   if (process.platform !== 'darwin') {
     console.log('INFO  Background service status is only available on macOS.');
@@ -1535,19 +1600,34 @@ function runStatus() {
   }
 }
 
-function runStop() {
-  if (process.platform !== 'darwin') {
-    console.log('INFO  Background service stop is only available on macOS.');
+function runStop(envFilePath) {
+  if (process.platform === 'darwin') {
+    const result = stopLaunchdService();
+    if (!result.installed) {
+      console.log(`INFO  No macOS background service is installed at ${result.plistPath}`);
+      return;
+    }
+
+    console.log(`OK    Stopped macOS background service at ${result.plistPath}`);
     return;
   }
 
-  const result = stopLaunchdService();
-  if (!result.installed) {
-    console.log(`INFO  No macOS background service is installed at ${result.plistPath}`);
+  if (process.platform === 'win32') {
+    const result = stopWindowsBackgroundService(envFilePath);
+    if (!result.pids.length) {
+      console.log(`INFO  No background backend process is listening on port ${result.port}.`);
+      return;
+    }
+
+    if (!result.stopped) {
+      throw new Error(`Failed to stop background backend process PID(s): ${result.failedPids.join(', ')}`);
+    }
+
+    console.log(`OK    Stopped background backend process on port ${result.port} (PID: ${result.pids.join(', ')}).`);
     return;
   }
 
-  console.log(`OK    Stopped macOS background service at ${result.plistPath}`);
+  console.log('INFO  Background service stop is available on macOS and Windows.');
 }
 
 function runRestart() {
@@ -1605,7 +1685,7 @@ async function main() {
   }
 
   if (command === 'stop') {
-    runStop();
+    runStop(envFilePath);
     return;
   }
 
@@ -1678,6 +1758,8 @@ module.exports = {
   readLaunchdServiceStatus,
   stopLaunchdService,
   restartLaunchdService,
+  findWindowsListeningPids,
+  stopWindowsBackgroundService,
   supportsColor,
   formatCliLevel,
   canPromptInteractively,
